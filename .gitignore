@@ -1,0 +1,23 @@
+# ── Never commit secrets ──
+.env
+*.env
+*.env.*
+appsettings.*.json
+!appsettings.json
+
+# ── Build artifacts ──
+bin/
+obj/
+/app/
+
+# ── Logs & state ──
+logs/
+state/
+*.log
+*.txt
+
+# ── IDE ──
+.vs/
+.vscode/
+*.user
+.DS_Store

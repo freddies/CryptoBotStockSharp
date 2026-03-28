@@ -1,0 +1,45 @@
+services:
+  cryptobot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cryptobot
+    restart: unless-stopped
+
+    # ── Load API keys from .env file ──
+    env_file:
+      - .env
+
+    # ── Persist logs, config, and state outside container ──
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state
+      - ./appsettings.json:/app/appsettings.json:ro
+
+    # ── Keep stdin open for interactive commands ──
+    stdin_open: true
+    tty: true
+
+    # ── P2 Fix: Healthcheck based on heartbeat file ──
+    # StatusReportLoop writes a heartbeat every 30 minutes.
+    # If no heartbeat for 60 minutes, the bot is considered stuck.
+    healthcheck:
+      test: ["CMD", "find", "/app/state/heartbeat", "-mmin", "-60"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+
+    # ── Resource limits (optional safety) ──
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+    # ── Logging ──
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

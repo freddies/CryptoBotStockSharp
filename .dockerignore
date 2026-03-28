@@ -1,0 +1,9 @@
+bin/
+obj/
+.env
+*.log
+logs/
+.git/
+.gitignore
+.DS_Store
+*.md
