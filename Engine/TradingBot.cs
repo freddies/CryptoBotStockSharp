@@ -120,6 +120,9 @@ public class TradingBot : IDisposable
     // FindAsset -> HashSet lookup
     private readonly Dictionary<string, string> _assetLookup;
 
+    // ── Track active subscription IDs for clean unsubscribe ──
+    private readonly List<long> _activeSubscriptionIds = new();
+
     public TradingBot(BotConfig config)
     {
         _config = config;
@@ -342,8 +345,8 @@ public class TradingBot : IDisposable
                 {
                     try
                     {
-                        Log("🔌 Attempting reconnect...");
-                        Connect();
+                        Log("🔌 Attempting reconnect via adapter reset...");
+                        ForceResetAdapter();
                     }
                     catch (Exception ex)
                     {
@@ -369,6 +372,7 @@ public class TradingBot : IDisposable
             Log($"✅ Reconnected to Binance! (after {prevAttempts} attempts) " +
                 $"Resubscribing to market data...");
 
+            // Fresh adapter — must resubscribe
             SubscribeMarketData();
 
             // Refresh balance on reconnect
@@ -457,8 +461,36 @@ public class TradingBot : IDisposable
         });
     }
 
+    private void ForceResetAdapter()
+    {
+        Log("🔧 Force-resetting adapter...");
+
+        try { _adapter.NewOutMessage -= OnMessage; } catch { }
+        try { _adapter.SendInMessage(new DisconnectMessage()); } catch { }
+        try { _adapter.Dispose(); } catch { }
+
+        Thread.Sleep(3000);
+
+        // Recreate fresh adapter with no subscription history
+        SetupAdapter();
+
+        // Reset transaction ID counter to avoid conflicts
+        // (subscriptions use these IDs internally)
+        Interlocked.Exchange(ref _transactionId, 0);
+
+        // Clear old subscription tracking
+        _activeSubscriptionIds.Clear();
+
+        Log("🔧 Adapter recreated. Connecting...");
+        Connect();
+    }
+
     private void SubscribeMarketData()
     {
+        // FIX: Unsubscribe old subscriptions first to prevent
+        // "duplicate key" errors that cause immediate disconnect
+        UnsubscribeAllMarketData();
+        
         foreach (var asset in _config.Assets.Distinct())
         {
             var secId = new SecurityId
@@ -467,34 +499,62 @@ public class TradingBot : IDisposable
                 BoardCode = BoardCodes.Binance,
             };
 
+            var txId1 = NextTransactionId();
+            _activeSubscriptionIds.Add(txId1);
             _adapter.SendInMessage(new MarketDataMessage
             {
                 SecurityId = secId,
                 DataType2 = DataType.Level1,
                 IsSubscribe = true,
-                TransactionId = NextTransactionId(),
+                TransactionId = txId1,
             });
 
+            var txId2 = NextTransactionId();
+            _activeSubscriptionIds.Add(txId2);
             _adapter.SendInMessage(new MarketDataMessage
             {
                 SecurityId = secId,
                 DataType2 = DataType.Ticks,
                 IsSubscribe = true,
-                TransactionId = NextTransactionId(),
+                TransactionId = txId2,
             });
 
+            var txId3 = NextTransactionId();
+            _activeSubscriptionIds.Add(txId3);
             _adapter.SendInMessage(new MarketDataMessage
             {
                 SecurityId = secId,
-                // New — use the Extensions method StockSharp recommends:
                 DataType2 = TimeSpan.FromMinutes(_config.CandleTimeframeMinutes).TimeFrame(),
                 IsSubscribe = true,
-                TransactionId = NextTransactionId(),
+                TransactionId = txId3,
             });
 
             _securityIds[asset] = secId;
             Log($"📡 Subscribed to all data for {asset}");
         }
+    }
+
+    private void UnsubscribeAllMarketData()
+    {
+        if (_activeSubscriptionIds.Count == 0) return;
+        
+        Log($"🔇 Unsubscribing {_activeSubscriptionIds.Count} old subscriptions...");
+        
+        foreach (var txId in _activeSubscriptionIds)
+        {
+            try
+            {
+                _adapter.SendInMessage(new MarketDataMessage
+                {
+                    IsSubscribe = false,
+                    OriginalTransactionId = txId,
+                    TransactionId = NextTransactionId(),
+                });
+            }
+            catch { }
+        }
+        
+        _activeSubscriptionIds.Clear();
     }
 
     private void ReplayBufferedCandles()
@@ -548,7 +608,11 @@ public class TradingBot : IDisposable
                 Interlocked.Exchange(ref _reconnectInProgress, 0);
                 if (_isRunning)
                 {
-                    try { Connect(); }
+                    try
+                    {
+                        Log("🔌 Attempting reconnect via adapter reset...");
+                        ForceResetAdapter();
+                    }
                     catch (Exception ex) { Log($"❌ Reconnect from disconnect failed: {ex.Message}"); }
                 }
             });
