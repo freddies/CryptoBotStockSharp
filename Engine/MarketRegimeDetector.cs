@@ -514,12 +514,14 @@ public class MarketRegimeDetector
     }
 
     /// <summary>
-    /// /// P2 Fix: Clamp value to [0.0, 1.0].
-    /// /// Applied to all regime scores before comparison to ensure fair ranking.
-    /// Linear interpolation: returns a when t=0, b when t=1.
+    /// P2 Fix: Clamp value to [0.0, 1.0].
+    /// Applied to all regime scores before comparison to ensure fair ranking.
     /// </summary>
     private static double Clamp01(double value) => Math.Max(0.0, Math.Min(1.0, value));
 
+    /// <summary>
+    /// Linear interpolation: returns a when t=0, b when t=1.
+    /// </summary>
     private static double Lerp(double a, double b, double t)
     {
         return a + (b - a) * t;

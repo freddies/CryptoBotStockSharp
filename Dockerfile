@@ -14,8 +14,9 @@ WORKDIR /app
 
 # P2 Fix: Create directories with correct ownership for non-root user.
 # .NET 9 containers run as non-root by default ($APP_UID).
+ARG APP_UID=1654
 RUN mkdir -p /app/logs /app/state && \
-    chown -R $APP_UID:$APP_UID /app/logs /app/state
+    chown -R ${APP_UID}:${APP_UID} /app/logs /app/state
 
 COPY --from=build /app .
 

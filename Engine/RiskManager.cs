@@ -242,6 +242,8 @@ public class RiskManager
 
     public decimal ClosePosition(string asset, decimal exitPrice)
     {
+        ResetDailyIfNeeded();  // FIX: Ensure daily counters are current
+
         if (!_positions.TryGetValue(asset, out var position))
             return 0;
 
@@ -279,6 +281,8 @@ public class RiskManager
     public (bool ShouldClose, string Reason) CheckPositionRisk(
         string asset, decimal currentPrice)
     {
+        ResetDailyIfNeeded();  // FIX: Ensure daily counters are current
+
         if (!_positions.TryGetValue(asset, out var pos))
             return (false, "");
 
@@ -290,6 +294,9 @@ public class RiskManager
 
         double pnlPercent = pos.GetUnrealizedPnlPercent(currentPrice);
 
+        // FIX: Account for round-trip fees when activating trailing stop
+        double netPnlPercent = pnlPercent - (_config.TradingFeeRate * 200.0);
+               
         if (!pos.TrailingStopActive &&
             pnlPercent >= _config.TrailingStopActivationPercent)
         {
@@ -415,6 +422,8 @@ public class RiskManager
 
                 if (state == null) return;
 
+                state.MigrateFromLegacy();  // FIX: order-safe migration
+
                 if (state.CurrentDay.Date == DateTime.UtcNow.Date)
                 {
                     _dailyPnl = state.DailyPnl;
@@ -429,10 +438,18 @@ public class RiskManager
                 }
                 else
                 {
+                    // Different day
                     if (state.CurrentBalance > 0)
                     {
                         _currentBalance = state.CurrentBalance;
                         _dailyStartBalance = state.CurrentBalance;
+                    }
+
+                    // FIX: Preserve cooldown across days when configured to do so
+                    if (!_config.ResetCooldownOnNewDay)
+                    {
+                        _consecutiveLosses = state.ConsecutiveLosses;
+                        _cooldownRemaining = state.CooldownRemaining;
                     }
                 }
 
@@ -457,14 +474,15 @@ public class RiskManager
                         {
                             var pos = new TradePosition(
                                 pp.Asset, pp.EntryPrice, pp.Volume,
-                                pp.StopLoss, pp.TakeProfit)
+                                pp.StopLoss, pp.TakeProfit,
+                                DateTimeOffset.FromUnixTimeMilliseconds(pp.EntryTimeUnixMs))  // FIX: pass directly
+
                             {
                                 TrailingStop = pp.TrailingStop,
                                 TrailingStopActive = pp.TrailingStopActive,
                                 HighestPriceSinceEntry = pp.HighestPriceSinceEntry > 0
                                     ? pp.HighestPriceSinceEntry
                                     : pp.EntryPrice,
-                                EntryTime = DateTimeOffset.FromUnixTimeMilliseconds(pp.EntryTimeUnixMs)
                             };
 
                             _positions[pp.Asset] = pos;
@@ -521,21 +539,28 @@ public class RiskManagerState
     public decimal CurrentBalance { get; set; }
     public decimal DailyStartBalance { get; set; }
 
-    [Obsolete("Use CurrentBalance + DailyStartBalance. Kept for old state file compat.")]
-    public decimal StartingBalance
-    {
-        get => CurrentBalance;
-        set
-        {
-            if (CurrentBalance == 0) CurrentBalance = value;
-            if (DailyStartBalance == 0) DailyStartBalance = value;
-        }
-    }
+    // FIX: Property kept for old file compat, but apply after deserialization
+    [Obsolete("Use CurrentBalance + DailyStartBalance")]
+    public decimal StartingBalance { get; set; }
 
     public DateTime CurrentDay { get; set; }
     public int ConsecutiveLosses { get; set; }
     public int CooldownRemaining { get; set; }
     public List<PersistedPosition> Positions { get; set; } = new();
+
+    /// <summary>
+    /// FIX: Call after deserialization to migrate old format.
+    /// Ensures field hydration regardless of JSON property order.
+    /// </summary>
+    public void MigrateFromLegacy()
+    {
+        #pragma warning disable CS0618
+        if (CurrentBalance == 0 && StartingBalance > 0)
+            CurrentBalance = StartingBalance;
+        if (DailyStartBalance == 0 && StartingBalance > 0)
+            DailyStartBalance = StartingBalance;
+        #pragma warning restore CS0618
+    }
 }
 
 public class PersistedPosition

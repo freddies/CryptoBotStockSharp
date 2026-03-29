@@ -9,9 +9,9 @@ namespace CryptoBotStockSharp.Models;
 /// </summary>
 public class TradePosition
 {
-    public string Asset { get; set; } = "";
-    public decimal EntryPrice { get; set; }
-    public decimal Volume { get; set; }
+    public string Asset { get; init; } = "";
+    public decimal EntryPrice { get; init; }
+    public decimal Volume { get; init; }
     public decimal StopLoss { get; set; }
     public decimal TakeProfit { get; set; }
     public decimal TrailingStop { get; set; }
@@ -24,7 +24,8 @@ public class TradePosition
     /// Validated constructor — enforces non-zero entry price and volume.
     /// </summary>
     public TradePosition(string asset, decimal entryPrice, decimal volume,
-                          decimal stopLoss, decimal takeProfit)
+                          decimal stopLoss, decimal takeProfit,
+                          DateTimeOffset? entryTime = null)
     {
         if (string.IsNullOrWhiteSpace(asset))
             throw new ArgumentException("Asset cannot be empty", nameof(asset));
@@ -43,7 +44,7 @@ public class TradePosition
         TrailingStop = 0;
         TrailingStopActive = false;
         HighestPriceSinceEntry = entryPrice;
-        EntryTime = DateTimeOffset.UtcNow;
+        EntryTime = entryTime ?? DateTimeOffset.UtcNow;  // FIX: avoid redundant syscall
     }
 
     /// <summary>

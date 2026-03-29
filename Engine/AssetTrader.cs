@@ -40,14 +40,23 @@ public class AssetTrader
 
     // ── Candle history for LLM brain context ──
     private readonly List<CandleRecord> _recentCandles = new();
+    private readonly object _candleHistoryLock = new();  // FIX: dedicated lock
     private const int MaxCandleHistory = 50;
 
     // ── Balance provider callback ──
     public Func<decimal>? BalanceProvider { get; set; }
 
-    // ── Public read access to candle history (for future LLM brain) ──
-    public IReadOnlyList<CandleRecord> RecentCandles => _recentCandles;
-
+    // FIX: Thread-safe read access
+    public IReadOnlyList<CandleRecord> RecentCandles
+    {
+        get
+        {
+            lock (_candleHistoryLock)
+            {
+                return _recentCandles.ToList();
+            }
+        }
+    }
     // Callbacks
     public event Action<string, SignalType, decimal, decimal>? OnTradeSignal;
     public event Action<string>? OnLog;
@@ -126,13 +135,17 @@ public class AssetTrader
         _candleCount++;
         _lastPrice = close;
 
-        _recentCandles.Add(new CandleRecord
+        // FIX: Protect candle history with dedicated lock
+        lock (_candleHistoryLock)
         {
-            Time = time, Open = open, High = high,
-            Low = low, Close = close, Volume = volume
-        });
-        if (_recentCandles.Count > MaxCandleHistory)
-            _recentCandles.RemoveAt(0);
+            _recentCandles.Add(new CandleRecord
+            {
+                Time = time, Open = open, High = high,
+                Low = low, Close = close, Volume = volume
+            });
+            if (_recentCandles.Count > MaxCandleHistory)
+                _recentCandles.RemoveAt(0);
+        }
 
         // ── Update both brains ──
         _indicators.Update(close);
@@ -179,7 +192,7 @@ public class AssetTrader
 
         if (!_isLive)
         {
-            var signal = _signalEngine.Analyze(_indicators, close);
+            var signal = _signalEngine.Analyze(_indicators, close, time);
             var b2 = _brain2.IsReady ? _brain2.Analyze(close) : null;
             var meta = _metaEngine.Decide(signal, b2, _currentRegime);
             Log($"🔍 [{_asset}] #{_candleCount} [HISTORICAL] {meta.Action} " +
@@ -189,18 +202,18 @@ public class AssetTrader
 
         if (_riskManager.HasPosition(_asset))
         {
-            HandleExistingPosition(close);
+            HandleExistingPosition(close, time);
             return;
         }
 
-        HandleNewSignal(close);
+        HandleNewSignal(close, time);
     }
 
     // ══════════════════════════════════════════════════════════
     //  POSITION MANAGEMENT
     // ══════════════════════════════════════════════════════════
 
-    private void HandleExistingPosition(decimal currentPrice)
+    private void HandleExistingPosition(decimal currentPrice, DateTimeOffset candleTime)
     {
         var (shouldClose, reason) = _riskManager.CheckPositionRisk(_asset, currentPrice);
 
@@ -212,7 +225,7 @@ public class AssetTrader
             return;
         }
 
-        var signal = _signalEngine.Analyze(_indicators, currentPrice);
+        var signal = _signalEngine.Analyze(_indicators, currentPrice, candleTime);
         var b2Signal = _brain2.IsReady ? _brain2.Analyze(currentPrice) : null;
         var meta = _metaEngine.Decide(signal, b2Signal, _currentRegime);
 
@@ -235,9 +248,9 @@ public class AssetTrader
         }
     }
 
-    private void HandleNewSignal(decimal currentPrice)
+    private void HandleNewSignal(decimal currentPrice, DateTimeOffset candleTime)
     {
-        var technicalSignal = _signalEngine.Analyze(_indicators, currentPrice);
+        var technicalSignal = _signalEngine.Analyze(_indicators, currentPrice, candleTime);
         var brain2Signal = _brain2.IsReady ? _brain2.Analyze(currentPrice) : null;
         var meta = _metaEngine.Decide(technicalSignal, brain2Signal, _currentRegime);
 

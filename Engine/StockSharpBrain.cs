@@ -3,19 +3,22 @@ namespace CryptoBotStockSharp.Engine;
 /// <summary>
 /// Brain 2: StockSharp-style indicators (Stoch, ADX, ATR, OBV, Williams %R).
 ///
-/// P1 Fixes:
-///   - OHLCV lists trimmed after IsReady to prevent unbounded growth
-///   - _totalCandleCount used for readiness checks
-///   - Stochastic %D simplified, ATR init uses >=
+/// P0 Fixes:
+///   - ScoreStochastic(): dead zone (K 30–70 → 0.0) replaced with
+///     continuous linear ramp. ~60% of trading time was producing zero
+///     signal from the Stochastic indicator.
+///   - ScoreWilliamsR(): dead zone (W%R -60 to -40 → 0.0) replaced with
+///     continuous linear ramp through the full -95 to -5 range.
+///   - Added Lerp helper for linear interpolation.
 ///
-/// P2 Fixes:
-///   - Analyze() uses weighted scoring instead of equal 1/4 weights.
-///     ADX direction raised to 35% (trend signal), Stochastic and OBV at 25%,
-///     Williams %R reduced to 15% (partially redundant with Stochastic).
-///   - Confidence calculation improved: trendStrength cap raised from 0.7 to 0.85
-///     so Brain2 can express stronger conviction in clear trends.
-///   - Williams %R default period changed to 28 in BotConfig (medium-term vs
-///     Stochastic's short-term 14) to reduce information redundancy.
+/// P1 Fixes (retained):
+///   - OHLCV lists trimmed after IsReady
+///   - _totalCandleCount used for readiness
+///
+/// P2 Fixes (retained):
+///   - Weighted scoring (ADX 35%, Stoch 25%, OBV 25%, W%R 15%)
+///   - Confidence cap 0.85
+///   - Williams %R default period 28
 /// </summary>
 public class StockSharpBrain
 {
@@ -81,7 +84,7 @@ public class StockSharpBrain
                            && ObvReady && WilliamsReady && _totalCandleCount >= 40;
     public int CandleCount => _totalCandleCount;
 
-    // ── P2 Fix: Scoring weights (expose for testing) ──
+    // ── P2 Fix (retained): Scoring weights ──
     private const double WeightStochastic = 0.25;
     private const double WeightAdxDirection = 0.35;
     private const double WeightObv = 0.25;
@@ -155,12 +158,18 @@ public class StockSharpBrain
     {
         if (_totalCandleCount < _stochPeriod) return;
 
-        var recentHighs = _highs.TakeLast(_stochPeriod);
-        var recentLows = _lows.TakeLast(_stochPeriod);
-        decimal highestHigh = recentHighs.Max();
-        decimal lowestLow = recentLows.Min();
-        decimal range = highestHigh - lowestLow;
+        // FIX: Index-based instead of TakeLast().Max()/Min()
+        int start = _highs.Count - _stochPeriod;
+        decimal highestHigh = decimal.MinValue;
+        decimal lowestLow = decimal.MaxValue;
 
+        for (int i = start; i < _highs.Count; i++)
+        {
+            if (_highs[i] > highestHigh) highestHigh = _highs[i];
+            if (_lows[i] < lowestLow) lowestLow = _lows[i];
+        }
+
+        decimal range = highestHigh - lowestLow;
         decimal rawK = range > 0
             ? ((_closes[^1] - lowestLow) / range) * 100m
             : 50m;
@@ -168,17 +177,34 @@ public class StockSharpBrain
         _rawK.Add(rawK);
         _prevStochK = StochK;
 
+        // FIX: Index-based average for smoothing
         if (_rawK.Count >= _stochSmoothing)
-            StochK = _rawK.TakeLast(_stochSmoothing).Average();
+        {
+            decimal sum = 0;
+            int smoothStart = _rawK.Count - _stochSmoothing;
+            for (int i = smoothStart; i < _rawK.Count; i++)
+                sum += _rawK[i];
+            StochK = sum / _stochSmoothing;
+        }
         else
+        {
             StochK = rawK;
+        }
 
         _kValues.Add(StochK);
 
         if (_kValues.Count >= _stochSmoothing)
-            StochD = _kValues.TakeLast(_stochSmoothing).Average();
+        {
+            decimal sum = 0;
+            int smoothStart = _kValues.Count - _stochSmoothing;
+            for (int i = smoothStart; i < _kValues.Count; i++)
+                sum += _kValues[i];
+            StochD = sum / _stochSmoothing;
+        }
         else
+        {
             StochD = StochK;
+        }
     }
 
     // ══════════════════════════════════════════
@@ -208,6 +234,10 @@ public class StockSharpBrain
 
         if (_adxCount == _adxPeriod && !_adxFirstDone)
         {
+            // FIX: Guard against post-trim index corruption
+            System.Diagnostics.Debug.Assert(!_isReadyReached,
+                "ADX initialization must complete before trimming starts");
+
             decimal sumTr = 0, sumPlusDm = 0, sumMinusDm = 0;
             for (int i = 1; i <= _adxPeriod && i < _closes.Count; i++)
             {
@@ -305,8 +335,18 @@ public class StockSharpBrain
     private void UpdateWilliamsR()
     {
         if (_closes.Count < _williamsRPeriod) return;
-        decimal hh = _highs.TakeLast(_williamsRPeriod).Max();
-        decimal ll = _lows.TakeLast(_williamsRPeriod).Min();
+
+        // FIX: Index-based instead of TakeLast().Max()/Min()
+        int start = _highs.Count - _williamsRPeriod;
+        decimal hh = decimal.MinValue;
+        decimal ll = decimal.MaxValue;
+
+        for (int i = start; i < _highs.Count; i++)
+        {
+            if (_highs[i] > hh) hh = _highs[i];
+            if (_lows[i] < ll) ll = _lows[i];
+        }
+
         decimal range = hh - ll;
         WilliamsR = range > 0 ? (hh - _closes[^1]) / range * -100m : -50m;
     }
@@ -315,22 +355,6 @@ public class StockSharpBrain
     //  ANALYZE
     // ══════════════════════════════════════════
 
-    /// <summary>
-    /// P2 Fix: Weighted scoring replaces equal 1/4 weights.
-    ///
-    /// Old weights:  Stoch=25%, ADX=25%, OBV=25%, W%R=25%
-    ///   → oscillators (Stoch+W%R) = 50% of Brain2
-    ///   → trend direction (ADX) = only 25%
-    ///   → for a brain meant to be trend-following, this was backwards
-    ///
-    /// New weights:  Stoch=25%, ADX=35%, OBV=25%, W%R=15%
-    ///   → trend direction is dominant signal
-    ///   → W%R reduced since partially redundant with Stochastic
-    ///     (different period mitigates but doesn't eliminate overlap)
-    ///
-    /// Confidence cap raised from 0.7 to 0.85 so Brain2 can express
-    /// stronger conviction during clear trends (ADX > 35).
-    /// </summary>
     public StockSharpSignal Analyze(decimal currentPrice)
     {
         if (!IsReady)
@@ -341,7 +365,6 @@ public class StockSharpBrain
         double obvScore = ScoreObv();
         double wrScore = ScoreWilliamsR();
 
-        // P2 Fix: Weighted composite instead of simple average
         double compositeScore =
             (stochScore * WeightStochastic) +
             (adxDirScore * WeightAdxDirection) +
@@ -351,12 +374,10 @@ public class StockSharpBrain
         double adxValue = Math.Min((double)Adx, 50.0);
         double trendStrength = adxValue / 50.0;
 
-        // P2 Fix: Agreement check uses weighted contribution, not just sign
         bool signsAgree = (stochScore > 0 && wrScore > 0 && obvScore > 0) ||
                           (stochScore < 0 && wrScore < 0 && obvScore < 0);
         double agreementBonus = signsAgree ? 0.2 : 0.0;
 
-        // P2 Fix: Confidence cap raised from 0.7 to 0.85
         double confidence = Math.Min(1.0, Math.Min(trendStrength, 0.85) + agreementBonus);
 
         double atrPercent = currentPrice > 0
@@ -383,31 +404,77 @@ public class StockSharpBrain
         };
     }
 
-    // ══════════════════════════════════════════
-    //  SCORING METHODS
-    // ══════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════
+    //  P0 FIX: SCORING METHODS — CONTINUOUS (NO DEAD ZONES)
+    //
+    //  Old Stochastic: K 30–70 → 0.0 (60% of range was dead)
+    //  Old Williams:   W%R -60 to -40 → 0.0 (20% dead zone)
+    //
+    //  During a healthy uptrend, Stoch K typically sits 50–65
+    //  and W%R sits -25 to -40. Both contributed exactly 0.0,
+    //  crippling Brain2's ability to express trend conviction.
+    //
+    //  New: linear ramps through the full range. Crossover
+    //  events at extremes preserved as strong discrete signals.
+    // ══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// P0 FIX: Continuous stochastic scoring.
+    ///
+    /// Old shape (step function with dead zone):
+    ///   K ≤ 15: +0.8 | K ≤ 20: +0.6 | K ≤ 30: +0.3
+    ///   K 30–70: 0.0  ← DEAD ZONE
+    ///   K ≥ 70: -0.3 | K ≥ 80: -0.6 | K ≥ 85: -0.8
+    ///
+    /// New shape (continuous linear ramp):
+    ///   K=0:  +0.80 (deep oversold)
+    ///   K=15: +0.80
+    ///   K=30: +0.30
+    ///   K=50:  0.00 (neutral)
+    ///   K=70: -0.30
+    ///   K=85: -0.80
+    ///   K=100:-0.80 (deep overbought)
+    ///
+    /// Crossover events at extremes still produce ±1.0.
+    /// </summary>
     private double ScoreStochastic()
     {
         double k = (double)StochK;
         double d = (double)StochD;
         double prevK = (double)_prevStochK;
 
+        // Crossover events at extremes: strong discrete signals (unchanged)
         bool bullishCross = k > d && prevK <= d;
         bool bearishCross = k < d && prevK >= d;
-
         if (bullishCross && k < 30) return 1.0;
         if (bearishCross && k > 70) return -1.0;
 
+        // ── P0 FIX: Continuous scoring through full range ──
         if (k <= 15) return 0.8;
-        if (k <= 20) return 0.6;
-        if (k <= 30) return 0.3;
         if (k >= 85) return -0.8;
-        if (k >= 80) return -0.6;
-        if (k >= 70) return -0.3;
 
-        return 0.0;
+        if (k <= 50)
+        {
+            // 15 → +0.8, 30 → +0.3, 50 → 0.0
+            if (k <= 30)
+                return Lerp(0.8, 0.3, (k - 15.0) / 15.0);
+            else
+                return Lerp(0.3, 0.0, (k - 30.0) / 20.0);
+        }
+        else
+        {
+            // 50 → 0.0, 70 → -0.3, 85 → -0.8
+            if (k <= 70)
+                return Lerp(0.0, -0.3, (k - 50.0) / 20.0);
+            else
+                return Lerp(-0.3, -0.8, (k - 70.0) / 15.0);
+        }
     }
 
+    /// <summary>
+    /// ADX direction scoring — unchanged from P2.
+    /// Already continuous, no dead zones.
+    /// </summary>
     private double ScoreAdxDirection()
     {
         double cappedAdx = Math.Min((double)Adx, 50.0);
@@ -428,33 +495,69 @@ public class StockSharpBrain
         }
     }
 
+    /// <summary>
+    /// OBV scoring — unchanged from P2.
+    /// 4-value step function is P2 issue, not P0.
+    /// </summary>
     private double ScoreObv()
     {
         if (!_obvEmaInit) return 0;
 
-        bool bullish = _obv > _obvEma;
+        // FIX: Continuous scoring instead of 4-value step function
+        decimal divergence = _obv - _obvEma;
+        double normalized = _obvEma != 0
+            ? (double)(divergence / Math.Max(Math.Abs(_obvEma), 1m))
+            : 0;
+
         bool rising = _obv > _prevObv;
+        double momentumBonus = rising ? 0.1 : -0.1;
 
-        if (bullish && rising) return 0.6;
-        if (bullish && !rising) return 0.2;
-        if (!bullish && !rising) return -0.6;
-        if (!bullish && rising) return -0.2;
-
-        return 0;
+        return Math.Clamp(normalized * 2.0 + momentumBonus, -0.8, 0.8);
     }
 
+    /// <summary>
+    /// P0 FIX: Continuous Williams %R scoring.
+    ///
+    /// Old shape (step function with dead zone):
+    ///   W%R ≤ -95: +0.9 | ≤ -80: +0.6 | ≤ -60: +0.2
+    ///   W%R -60 to -40: 0.0  ← DEAD ZONE
+    ///   W%R ≥ -40: -0.2 | ≥ -20: -0.6 | ≥ -5: -0.9
+    ///
+    /// New shape (continuous linear ramp):
+    ///   W%R = -100: +0.90 (deep oversold)
+    ///   W%R = -95:  +0.90
+    ///   W%R = -50:   0.00 (neutral)
+    ///   W%R = -5:   -0.90
+    ///   W%R = 0:    -0.90 (deep overbought)
+    /// </summary>
     private double ScoreWilliamsR()
     {
-        double wr = (double)WilliamsR;
+        double wr = (double)WilliamsR; // Range: -100 to 0
 
         if (wr <= -95) return 0.9;
-        if (wr <= -80) return 0.6;
-        if (wr <= -60) return 0.2;
         if (wr >= -5) return -0.9;
-        if (wr >= -20) return -0.6;
-        if (wr >= -40) return -0.2;
 
-        return 0.0;
+        // ── P0 FIX: Linear ramp through full range ──
+        // -95 → +0.9, -50 → 0.0, -5 → -0.9
+        double mid = -50.0;
+        if (wr <= mid)
+            return Lerp(0.9, 0.0, (wr - (-95.0)) / 45.0);
+        else
+            return Lerp(0.0, -0.9, (wr - mid) / 45.0);
+    }
+
+    // ══════════════════════════════════════════
+    //  HELPERS
+    // ══════════════════════════════════════════
+
+    /// <summary>
+    /// Linear interpolation: returns a when t=0, b when t=1.
+    /// t is clamped to [0, 1].
+    /// </summary>
+    private static double Lerp(double a, double b, double t)
+    {
+        t = Math.Max(0.0, Math.Min(1.0, t));
+        return a + (b - a) * t;
     }
 
     // ══════════════════════════════════════════

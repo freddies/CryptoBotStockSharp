@@ -22,7 +22,8 @@ public class SignalEngine
         _config = config;
     }
 
-    public TradeSignal Analyze(TechnicalIndicators indicators, decimal currentPrice)
+    public TradeSignal Analyze(TechnicalIndicators indicators, decimal currentPrice,
+                                DateTimeOffset? candleTime = null)
     {
         if (!indicators.AllReady)
         {
@@ -68,7 +69,7 @@ public class SignalEngine
             BollingerScore = bollingerScore,
             EmaScore = emaScore,
             MacdScore = macdScore,
-            Timestamp = DateTimeOffset.UtcNow
+            Timestamp = candleTime ?? DateTimeOffset.UtcNow  // FIX: use candle time
         };
 
         if (composite >= _config.BuyScoreThreshold)
@@ -185,17 +186,16 @@ public class SignalEngine
         bool currentAbove = ind.EmaFastAboveSlow;
         bool previousAbove = ind.PreviousEmaFastAboveSlow;
 
-        // Crossover events: strong discrete signals (intentionally not continuous)
         if (currentAbove && !previousAbove) return 1.0;
         if (!currentAbove && previousAbove) return -1.0;
 
-        // Sustained trend: continuous based on EMA gap
         if (ind.EmaSlow == 0) return 0.0;
 
         double gap = (double)(ind.EmaFast - ind.EmaSlow) / (double)ind.EmaSlow * 100.0;
 
-        // Clamp to ±0.6 — crossovers are the only way to hit ±1.0
-        return Math.Clamp(gap * 0.15, -0.6, 0.6);
+        // FIX: Tanh curve instead of linear clamp — approaches ±0.6 asymptotically
+        // Old: saturated at 4% gap. New: 4% → 0.31, 8% → 0.48, 15% → 0.57
+        return Math.Tanh(gap * 0.08) * 0.6;
     }
 
     /// <summary>
@@ -215,18 +215,21 @@ public class SignalEngine
         if (prevHistogram <= 0 && histogram > 0) return 1.0;
         if (prevHistogram >= 0 && histogram < 0) return -1.0;
 
-        // Sustained state: direction + momentum
+        // FIX: Magnitude-aware scoring instead of flat 4-value step
         if (histogram > 0)
         {
-            // Positive histogram: bullish, boosted if rising
-            double momentum = rising ? 0.6 : 0.3;
-            return momentum;
+            double baseScore = rising ? 0.6 : 0.3;
+            // Boost by momentum magnitude (how fast histogram is changing)
+            double momentum = Math.Abs(histogram - prevHistogram);
+            double momentumBoost = Math.Min(momentum / (Math.Abs(histogram) + 0.0001) * 0.2, 0.2);
+            return Math.Min(baseScore + momentumBoost, 0.8);
         }
         else if (histogram < 0)
         {
-            // Negative histogram: bearish, boosted if falling
-            double momentum = rising ? -0.3 : -0.6;
-            return momentum;
+            double baseScore = rising ? -0.3 : -0.6;
+            double momentum = Math.Abs(histogram - prevHistogram);
+            double momentumBoost = Math.Min(momentum / (Math.Abs(histogram) + 0.0001) * 0.2, 0.2);
+            return Math.Max(baseScore - momentumBoost, -0.8);
         }
 
         return 0.0;

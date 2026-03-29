@@ -89,7 +89,8 @@ public class TechnicalIndicators
         _macdSignalPeriod = macdSignalPeriod;
 
         _maxClosesNeeded = Math.Max(bollingerPeriod,
-            Math.Max(macdSlowPeriod, emaSlowPeriod)) + 5;
+            Math.Max(macdSlowPeriod,
+            Math.Max(emaSlowPeriod, rsiPeriod + 1))) + 5;
     }
 
     public void Update(decimal close)
@@ -194,7 +195,10 @@ public class TechnicalIndicators
         }
 
         if (!_previousEmaReady && EmaReady)
+        {
             _previousEmaReady = true;
+            PreviousEmaFastAboveSlow = EmaFastAboveSlow;
+        }
     }
 
     // ══════════════════════════════════════════
@@ -211,12 +215,21 @@ public class TechnicalIndicators
     {
         if (_closes.Count < _bollingerPeriod) return;
 
-        var window = _closes.TakeLast(_bollingerPeriod).ToList();
-        decimal mean = window.Average();
-        decimal sumSquares = window.Sum(x => (x - mean) * (x - mean));
+        // FIX: Index-based access instead of TakeLast().ToList()
+        int start = _closes.Count - _bollingerPeriod;
 
-        // P2 Fix: Divide by (N-1) for sample std dev, not N for population.
-        // Guard: if period is 1, fall back to 0 to avoid divide-by-zero.
+        decimal sum = 0;
+        for (int i = start; i < _closes.Count; i++)
+            sum += _closes[i];
+        decimal mean = sum / _bollingerPeriod;
+
+        decimal sumSquares = 0;
+        for (int i = start; i < _closes.Count; i++)
+        {
+            decimal diff = _closes[i] - mean;
+            sumSquares += diff * diff;
+        }
+
         decimal variance = _bollingerPeriod > 1
             ? sumSquares / (_bollingerPeriod - 1)
             : 0;

@@ -16,20 +16,27 @@ namespace CryptoBotStockSharp.Engine;
 /// <summary>
 /// Main trading bot engine.
 ///
-/// P0 Fixes:
+/// P0 Fixes (NEW):
+///   - HandleConnect: reconnect logic for ConnectMessage with errors.
+///     Old code logged "Connection failed" and returned → WebSocket dead forever.
+///     New code schedules reconnect with exponential backoff.
+///   - HandleConnect: reconnect path resubscribes without re-initializing traders.
+///   - _pollingLoopStarted: prevents duplicate CandlePollingLoop on reconnect.
+///   - _pendingOrders: prevents double-buy when REST order is in flight.
+///
+/// P0 Fixes (retained from original):
 ///   - StopAsync: positions closed BEFORE CTS cancellation
 ///   - StopAsync: atomic guard prevents double-shutdown race
 ///   - HandleExecution: rejects WS fills without exchange OrderId
-///   - CloseAllPositions: now async, awaits REST order completion
+///   - CloseAllPositions: async, awaits REST order completion
 ///
-/// P1 Fixes:
-///   - _lastPrices: ConcurrentDictionary for thread-safe writes from adapter thread
-///   - HandleCandle: TOCTOU fixed by checking _tradersInitialized inside _lock
-///   - _bufferLock eliminated: _candleBuffer now protected by _lock
-///   - ThrottledRestCallAsync: pre-call delay replaces fire-and-forget release
-///   - Stale position warnings logged after historical candle preload
+/// P1 Fixes (retained):
+///   - _lastPrices: ConcurrentDictionary
+///   - HandleCandle: TOCTOU fixed
+///   - ThrottledRestCallAsync: pre-call delay
+///   - Stale position warnings
 ///
-/// P2: REST rate limiting, _processedOrderIds trim, configurable fees
+/// P2 (retained): REST rate limiting, _processedOrderIds trim, configurable fees
 /// </summary>
 public class TradingBot : IDisposable
 {
@@ -44,9 +51,7 @@ public class TradingBot : IDisposable
     // Security info cache
     private readonly Dictionary<string, SecurityId> _securityIds = new();
 
-    // P1 FIX: ConcurrentDictionary for thread-safe price updates.
-    // HandleLevel1 writes from the adapter message thread without holding _lock.
-    // Previously used Dictionary<> which is not thread-safe for concurrent read/write.
+    // P1 FIX: ConcurrentDictionary for thread-safe price updates
     private readonly ConcurrentDictionary<string, decimal> _lastPrices = new();
 
     // Portfolio
@@ -56,7 +61,7 @@ public class TradingBot : IDisposable
 
     // State
     private bool _isRunning;
-    private bool _isConnected;
+    private volatile bool _isConnected;
     private readonly object _lock = new();
     private int _totalTrades;
     private int _winningTrades;
@@ -67,26 +72,34 @@ public class TradingBot : IDisposable
     // ── P0: Atomic shutdown guard ──
     private int _stopRequested;
 
+    // ── P0 FIX: Reconnect state ──
+    private volatile int _reconnectAttempts;
+    private const int MaxReconnectAttempts = 50;
+    private static readonly int[] ReconnectBackoffMs = { 5000, 10000, 30000, 60000, 120000 };
+
+    // ── P0 FIX: Prevent duplicate polling loops ──
+    private int _pollingLoopStarted;
+
+    // ── P0 FIX: Prevent double-buy while REST order in flight ──
+    // FIX: Track pending order timestamps for stale detection
+    private readonly ConcurrentDictionary<string, DateTime> _pendingOrders = new();
+
     // ── P0: Dedup order fills ──
     private readonly Dictionary<long, DateTime> _processedOrderIds = new();
     private readonly object _orderIdLock = new();
     private DateTime _lastOrderIdTrim = DateTime.UtcNow;
     private const int MaxProcessedOrderIds = 1000;
 
-    // ── P1 FIX: Candle buffer protected by _lock (was separate _bufferLock) ──
-    // Eliminates TOCTOU race where _tradersInitialized flips between
-    // the volatile read and the buffer add, losing the candle.
+    // ── P1 FIX: Candle buffer protected by _lock ──
     private readonly List<BufferedCandle> _candleBuffer = new();
 
     // ── P1: Exchange info for LOT_SIZE ──
     private readonly Dictionary<string, SymbolFilter> _symbolFilters = new();
+    #pragma warning disable CS0414 // Reserved for future health-check / diagnostics
     private bool _exchangeInfoLoaded;
+    #pragma warning restore CS0414
 
     // ── P1 FIX: REST rate limiting with pre-call delay ──
-    // Old approach: fire-and-forget Task.Run to release semaphore after delay.
-    // Problem: the background task could outlive Dispose(), throwing
-    // ObjectDisposedException on _restThrottle.Release().
-    // New approach: delay BEFORE the call, release immediately in finally.
     private readonly SemaphoreSlim _restThrottle = new(1, 1);
     private const int RestDelayMs = 100;
     private DateTime _lastRestCallTime = DateTime.MinValue;
@@ -101,9 +114,17 @@ public class TradingBot : IDisposable
     // Persistence
     private readonly string _stateDirectory;
 
+    // Reconnect stacking guard
+    private int _reconnectInProgress;
+
+    // FindAsset -> HashSet lookup
+    private readonly Dictionary<string, string> _assetLookup;
+
     public TradingBot(BotConfig config)
     {
         _config = config;
+        _assetLookup = _config.Assets.Distinct()
+            .ToDictionary(a => a, a => a, StringComparer.OrdinalIgnoreCase);
 
         var baseDir = AppDomain.CurrentDomain.BaseDirectory;
         _logFile = Path.Combine(baseDir, "logs",
@@ -209,7 +230,9 @@ public class TradingBot : IDisposable
     {
         try
         {
-            if (message.Type != MessageTypes.Time)
+            // FIX: Exclude high-frequency message types from disk logging
+            if (message.Type != MessageTypes.Time &&
+                message.Type != MessageTypes.Level1Change)
                 Log($"📨 MSG: {message.Type} | {message}");
 
             switch (message.Type)
@@ -230,10 +253,14 @@ public class TradingBot : IDisposable
                     HandleCandle((TimeFrameCandleMessage)message);
                     break;
                 case MessageTypes.Portfolio:
+                #pragma warning disable CS0612 // StockSharp deprecated PortfolioChange, still functional
                 case MessageTypes.PortfolioChange:
+                #pragma warning restore CS0612
                     HandlePortfolio(message);
                     break;
+                #pragma warning disable CS0612 // StockSharp deprecated Position, still functional
                 case MessageTypes.Position:
+                #pragma warning restore CS0612
                 case MessageTypes.PositionChange:
                     HandlePosition(message);
                     break;
@@ -260,18 +287,116 @@ public class TradingBot : IDisposable
     }
 
     // ══════════════════════════════════════════════════════════
-    //  CONNECTION
+    //  CONNECTION — P0 FIX: RECONNECT LOGIC
     // ══════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// P0 FIX: Comprehensive reconnect handling.
+    ///
+    /// StockSharp sends disconnection events as ConnectMessage with an Error,
+    /// NOT as DisconnectMessage. The old code logged the error and returned,
+    /// leaving the WebSocket dead forever while only REST polling continued.
+    ///
+    /// New behavior:
+    ///   - On error: schedule reconnect with exponential backoff
+    ///   - On success after reconnect: resubscribe without re-initializing
+    ///   - On first success: full initialization (unchanged)
+    ///   - Duplicate polling loop prevented via _pollingLoopStarted guard
+    /// </summary>
     private void HandleConnect(ConnectMessage msg)
     {
         if (msg.Error != null)
         {
-            Log($"❌ Connection failed: {msg.Error.Message}");
+            // ── P0 FIX: Connection failed — schedule reconnect ──
+            _isConnected = false;
+            _reconnectAttempts++;
+
+            Log($"❌ Connection failed (attempt {_reconnectAttempts}/{MaxReconnectAttempts}): " +
+                $"{msg.Error.Message}");
+
+            if (!_isRunning) return;
+
+            if (_reconnectAttempts > MaxReconnectAttempts)
+            {
+                Log("🚨 Max reconnect attempts reached. Running on REST-only mode. ");
+                return;
+            }
+
+                // FIX: Prevent stacked reconnect chains
+                if (Interlocked.CompareExchange(ref _reconnectInProgress, 1, 0) != 0)
+                {
+                    Log("ℹ️ Reconnect already scheduled, skipping duplicate");
+                    return;
+                }
+
+            int backoffIdx = Math.Min(_reconnectAttempts - 1, ReconnectBackoffMs.Length - 1);
+            int delayMs = ReconnectBackoffMs[backoffIdx];
+
+            Log($"🔄 Reconnecting in {delayMs / 1000}s " +
+                $"(attempt {_reconnectAttempts + 1})...");
+
+            Task.Delay(delayMs).ContinueWith(_ =>
+            {
+                Interlocked.Exchange(ref _reconnectInProgress, 0);  // FIX: clear guard
+                if (_isRunning)
+                {
+                    try
+                    {
+                        Log("🔌 Attempting reconnect...");
+                        Connect();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"❌ Reconnect call failed: {ex.Message}");
+                    }
+                }
+            });
+
             return;
         }
 
+        // ── Successful connection ──
         _isConnected = true;
+        Interlocked.Exchange(ref _reconnectInProgress, 0);
+        int prevAttempts = _reconnectAttempts;
+        _reconnectAttempts = 0;
+
+        if (_tradersInitialized)
+        {
+            // ── P0 FIX: RECONNECT path — just resubscribe ──
+            // Traders, risk manager, and polling loop already exist.
+            // Only need to restore WebSocket market data subscriptions.
+            Log($"✅ Reconnected to Binance! (after {prevAttempts} attempts) " +
+                $"Resubscribing to market data...");
+
+            SubscribeMarketData();
+
+            // Refresh balance on reconnect
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var bal = await ThrottledRestCallAsync(() => FetchUsdtBalanceAsync());
+                    if (bal.HasValue && bal.Value > 0)
+                    {
+                        lock (_lock)
+                        {
+                            _currentBalance = bal.Value;
+                            _riskManager?.UpdateBalance(_currentBalance);
+                        }
+                        Log($"💵 Balance after reconnect: ${bal.Value:F2}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log($"⚠️ Balance refresh after reconnect failed: {ex.Message}");
+                }
+            });
+
+            return;
+        }
+
+        // ── FIRST connection: full initialization ──
         Log("✅ Connected to Binance!");
 
         var boardCode = _adapter.AssociatedBoards.FirstOrDefault() ?? "BNB";
@@ -310,7 +435,15 @@ public class TradingBot : IDisposable
                 SubscribeMarketData();
                 ReplayBufferedCandles();
 
-                _ = Task.Run(CandlePollingLoop);
+                // ── P0 FIX: Guard against duplicate polling loops ──
+                if (Interlocked.CompareExchange(ref _pollingLoopStarted, 1, 0) == 0)
+                {
+                    _ = Task.Run(CandlePollingLoop);
+                }
+                else
+                {
+                    Log("ℹ️ Polling loop already running, skipping duplicate start.");
+                }
             }
             catch (Exception ex)
             {
@@ -353,7 +486,8 @@ public class TradingBot : IDisposable
             _adapter.SendInMessage(new MarketDataMessage
             {
                 SecurityId = secId,
-                DataType2 = DataType.TimeFrame(TimeSpan.FromMinutes(_config.CandleTimeframeMinutes)),
+                // New — use the Extensions method StockSharp recommends:
+                DataType2 = TimeSpan.FromMinutes(_config.CandleTimeframeMinutes).TimeFrame(),
                 IsSubscribe = true,
                 TransactionId = NextTransactionId(),
             });
@@ -363,38 +497,35 @@ public class TradingBot : IDisposable
         }
     }
 
-    /// <summary>
-    /// P1 FIX: Uses _lock instead of separate _bufferLock.
-    /// Consistent with HandleCandle which now also uses _lock for buffering.
-    /// </summary>
     private void ReplayBufferedCandles()
     {
-        List<BufferedCandle> toReplay;
+        // FIX: Single lock to prevent race between buffer drain and WS candle arrival
         lock (_lock)
         {
-            toReplay = new List<BufferedCandle>(_candleBuffer);
-            _candleBuffer.Clear();
-        }
+            if (_candleBuffer.Count == 0) return;
 
-        if (toReplay.Count > 0)
-        {
-            Log($"🔄 Replaying {toReplay.Count} buffered candles...");
-            lock (_lock)
+            Log($"🔄 Replaying {_candleBuffer.Count} buffered candles...");
+
+            foreach (var bc in _candleBuffer)
             {
-                foreach (var bc in toReplay)
+                var asset = FindAsset(bc.SecurityCode);
+                if (asset != null && _traders.TryGetValue(asset, out var trader))
                 {
-                    var asset = FindAsset(bc.SecurityCode);
-                    if (asset != null && _traders.TryGetValue(asset, out var trader))
-                    {
-                        trader.ProcessCandle(bc.Open, bc.High, bc.Low,
-                            bc.Close, bc.Volume, bc.OpenTime);
-                        _lastPrices[asset] = bc.Close;
-                    }
+                    trader.ProcessCandle(bc.Open, bc.High, bc.Low,
+                        bc.Close, bc.Volume, bc.OpenTime);
+                    _lastPrices[asset] = bc.Close;
                 }
             }
+
+            _candleBuffer.Clear();
         }
     }
 
+    /// <summary>
+    /// P0 FIX: HandleDisconnect also triggers reconnect.
+    /// Some adapters may send DisconnectMessage instead of ConnectMessage(Error).
+    /// Both paths now lead to reconnection.
+    /// </summary>
     private void HandleDisconnect(DisconnectMessage msg)
     {
         _isConnected = false;
@@ -402,10 +533,24 @@ public class TradingBot : IDisposable
 
         if (_isRunning)
         {
-            Log("🔄 Attempting reconnect in 10 seconds...");
-            Task.Delay(10000).ContinueWith(_ =>
+            // FIX: Use same guard to prevent stacking
+            if (Interlocked.CompareExchange(ref _reconnectInProgress, 1, 0) != 0)
             {
-                if (_isRunning) Connect();
+                Log("ℹ️ Reconnect already in progress from HandleConnect");
+                return;
+            }
+
+            _reconnectAttempts = Math.Max(_reconnectAttempts, 1);
+            int delayMs = ReconnectBackoffMs[0];
+            Log($"🔄 Attempting reconnect in {delayMs / 1000}s...");
+            Task.Delay(delayMs).ContinueWith(_ =>
+            {
+                Interlocked.Exchange(ref _reconnectInProgress, 0);
+                if (_isRunning)
+                {
+                    try { Connect(); }
+                    catch (Exception ex) { Log($"❌ Reconnect from disconnect failed: {ex.Message}"); }
+                }
             });
         }
     }
@@ -422,11 +567,6 @@ public class TradingBot : IDisposable
             Log($"📊 Security info: {code}");
     }
 
-    /// <summary>
-    /// P1 FIX: _lastPrices is now ConcurrentDictionary, so this is safe
-    /// without holding _lock. Previously used Dictionary which could
-    /// corrupt its internal state on concurrent read/write.
-    /// </summary>
     private void HandleLevel1(Level1ChangeMessage msg)
     {
         var code = msg.SecurityId.SecurityCode ?? "";
@@ -442,21 +582,6 @@ public class TradingBot : IDisposable
             _lastPrices[asset] = price;
     }
 
-    /// <summary>
-    /// P1 FIX: TOCTOU race eliminated.
-    ///
-    /// Old code:
-    ///   if (!_tradersInitialized)          // volatile read, NO lock
-    ///       lock (_bufferLock) { buffer }  // separate lock
-    ///   else
-    ///       lock (_lock) { process }       // main lock
-    ///
-    /// Race window: _tradersInitialized flips between the volatile read
-    /// and the lock acquisition. The candle is neither buffered nor processed.
-    ///
-    /// New code: everything under _lock. The check + buffer/process is atomic.
-    /// _bufferLock is eliminated entirely.
-    /// </summary>
     private void HandleCandle(TimeFrameCandleMessage candle)
     {
         Log($"🕯️ Candle [{candle.SecurityId.SecurityCode}] state={candle.State} " +
@@ -468,9 +593,6 @@ public class TradingBot : IDisposable
 
         var code = candle.SecurityId.SecurityCode ?? "";
 
-        // P1 FIX: Single lock for both the initialized check AND the
-        // buffer/process action. No window for _tradersInitialized to
-        // change between the check and the action.
         lock (_lock)
         {
             if (!_tradersInitialized)
@@ -523,20 +645,24 @@ public class TradingBot : IDisposable
 
             if (code.Contains("USDT", StringComparison.OrdinalIgnoreCase) && currentValue.HasValue)
             {
-                _currentBalance = currentValue.Value;
-                if (_initialBalance == 0)
-                    _initialBalance = _currentBalance;
-
-                Log($"💵 USDT Balance: ${_currentBalance:F2}");
-
-                if (_riskManager == null)
+                // P0 FIX: Use _lock for _initialBalance consistency
+                lock (_lock)
                 {
-                    _riskManager = new RiskManager(_config, _currentBalance, _stateDirectory);
-                    Log($"🛡️ Risk manager initialized with ${_currentBalance:F2}");
-                }
-                else
-                {
-                    _riskManager.UpdateBalance(_currentBalance);
+                    _currentBalance = currentValue.Value;
+                    if (_initialBalance == 0)
+                        _initialBalance = _currentBalance;
+
+                    Log($"💵 USDT Balance: ${_currentBalance:F2}");
+
+                    if (_riskManager == null)
+                    {
+                        _riskManager = new RiskManager(_config, _currentBalance, _stateDirectory);
+                        Log($"🛡️ Risk manager initialized with ${_currentBalance:F2}");
+                    }
+                    else
+                    {
+                        _riskManager.UpdateBalance(_currentBalance);
+                    }
                 }
             }
         }
@@ -597,6 +723,9 @@ public class TradingBot : IDisposable
 
     private void ProcessFill(string asset, string side, decimal price, decimal quantity)
     {
+        // ── P0 FIX: Clear pending order flag ──
+        _pendingOrders.TryRemove(asset, out _);  // FIX: thread-safe remove
+
         if (side == "BUY")
         {
             var pos = _riskManager.OpenPosition(asset, price, quantity);
@@ -703,7 +832,7 @@ public class TradingBot : IDisposable
     }
 
     // ══════════════════════════════════════════════════════════
-    //  TRADE EXECUTION
+    //  TRADE EXECUTION — P0 FIX: PENDING ORDER GUARD
     // ══════════════════════════════════════════════════════════
 
     private void OnTradeSignalReceived(string asset, SignalType signal,
@@ -731,8 +860,33 @@ public class TradingBot : IDisposable
         }
     }
 
+    /// <summary>
+    /// P0 FIX: Added _pendingOrders guard.
+    ///
+    /// Race scenario without guard:
+    ///   1. Candle #103 → BUY signal → REST order fires (async)
+    ///   2. Candle #104 arrives before REST completes
+    ///   3. _riskManager.HasPosition() = false (REST hasn't called ProcessFill yet)
+    ///   4. Another BUY fires for the same asset → DOUBLE POSITION
+    ///
+    /// Fix: _pendingOrders tracks assets with in-flight orders.
+    /// Cleared in ProcessFill when the order completes (or fails).
+    /// </summary>
     private void ExecuteBuy(string asset, SecurityId secId, decimal currentPrice)
     {
+        // ── P0 FIX: Check for in-flight order ──
+        // FIX: Check with stale timeout
+        if (_pendingOrders.TryGetValue(asset, out var pendingSince))
+        {
+            if ((DateTime.UtcNow - pendingSince).TotalSeconds < 120)
+            {
+                Log($"⏳ [{asset}] Buy blocked: order in flight since {pendingSince:HH:mm:ss}");
+                return;
+            }
+            Log($"⚠️ [{asset}] Clearing stale pending order from {pendingSince:HH:mm:ss}");
+            _pendingOrders.TryRemove(asset, out _);
+        }
+
         var (canOpen, reason) = _riskManager.CanOpenPosition(asset, _currentBalance);
         if (!canOpen)
         {
@@ -764,16 +918,50 @@ public class TradingBot : IDisposable
         positionVolume = RoundVolume(asset, positionVolume);
         if (positionVolume <= 0) return;
 
+        // ── P0 FIX: Mark order as in-flight ──
+        // FIX: Store timestamp
+        _pendingOrders[asset] = DateTime.UtcNow;
+
         Log($"🟢 [{asset}] BUY: {positionVolume} @ ~${currentPrice:F2} " +
             $"(${positionVolume * currentPrice:F2})");
 
-        _ = Task.Run(() => ThrottledRestCallAsync(
-            () => ExecuteOrderViaRestAsync(asset, "BUY", positionVolume)));
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await ThrottledRestCallAsync(
+                    () => ExecuteOrderViaRestAsync(asset, "BUY", positionVolume));
+            }
+            catch (Exception ex)
+            {
+                Log($"❌ [{asset}] Buy order failed: {ex.Message}");
+                // Clear pending flag on failure so future signals can retry
+                _pendingOrders.TryRemove(asset, out _);  // FIX: thread-safe remove
+            }
+        });
     }
 
+    /// <summary>
+    /// P0 FIX: Added _pendingOrders guard for sells too.
+    /// Prevents double-sell if trailing stop and signal-based exit fire
+    /// on the same candle.
+    /// </summary>
     private void ExecuteSell(string asset, SecurityId secId,
                             decimal currentPrice, decimal volume)
     {
+        // ── P0 FIX: Check for in-flight order ──
+        // FIX: Same stale-aware check
+        if (_pendingOrders.TryGetValue(asset, out var pendingSince))
+        {
+            if ((DateTime.UtcNow - pendingSince).TotalSeconds < 120)
+            {
+                Log($"⏳ [{asset}] Sell blocked: order in flight since {pendingSince:HH:mm:ss}");
+                return;
+            }
+            Log($"⚠️ [{asset}] Clearing stale pending order from {pendingSince:HH:mm:ss}");
+            _pendingOrders.TryRemove(asset, out _);
+        }
+
         var position = _riskManager.GetPosition(asset);
         decimal sellVolume = volume > 0 ? volume : (position?.Volume ?? 0);
 
@@ -786,10 +974,24 @@ public class TradingBot : IDisposable
         sellVolume = RoundVolume(asset, sellVolume);
         if (sellVolume <= 0) return;
 
+        // ── P0 FIX: Mark order as in-flight ──
+        _pendingOrders[asset] = DateTime.UtcNow;  // FIX: timestamp
+
         Log($"🔴 [{asset}] SELL: {sellVolume} @ ~${currentPrice:F2}");
 
-        _ = Task.Run(() => ThrottledRestCallAsync(
-            () => ExecuteOrderViaRestAsync(asset, "SELL", sellVolume)));
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await ThrottledRestCallAsync(
+                    () => ExecuteOrderViaRestAsync(asset, "SELL", sellVolume));
+            }
+            catch (Exception ex)
+            {
+                Log($"❌ [{asset}] Sell order failed: {ex.Message}");
+                _pendingOrders.TryRemove(asset, out _);  // FIX
+            }
+        });
     }
 
     // ══════════════════════════════════════════════════════════
@@ -827,7 +1029,8 @@ public class TradingBot : IDisposable
     {
         Log("🔄 Closing all open positions...");
 
-        var closeTasks = new List<Task>();
+        // ── Build list of positions to close ──
+        var closePairs = new List<(string Asset, decimal Volume)>();
 
         lock (_lock)
         {
@@ -836,32 +1039,37 @@ public class TradingBot : IDisposable
                 var position = _riskManager?.GetPosition(asset);
                 if (position == null) continue;
 
-                decimal price = _lastPrices.GetValueOrDefault(asset, position.EntryPrice);
                 decimal sellVolume = RoundVolume(asset, position.Volume);
-
                 if (sellVolume <= 0)
                 {
                     Log($"⚠️ [{asset}] Cannot close — volume rounds to 0");
                     continue;
                 }
 
+                decimal price = _lastPrices.GetValueOrDefault(asset, position.EntryPrice);
                 Log($"🔴 [{asset}] Closing position: {sellVolume} @ ~${price:F2}");
-                closeTasks.Add(ExecuteOrderViaRestAsync(asset, "SELL", sellVolume));
+                closePairs.Add((asset, sellVolume));
             }
         }
 
-        if (closeTasks.Count > 0)
+        if (closePairs.Count > 0)
         {
-            Log($"⏳ Waiting for {closeTasks.Count} position close(s)...");
+            Log($"⏳ Closing {closePairs.Count} position(s) sequentially...");
             try
             {
-                await Task.WhenAll(closeTasks).WaitAsync(TimeSpan.FromSeconds(15));
+                foreach (var (asset, sellVolume) in closePairs)
+                {
+                    try
+                    {
+                        await ThrottledRestCallAsync(
+                            () => ExecuteOrderViaRestAsync(asset, "SELL", sellVolume));
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"⚠️ [{asset}] Close failed: {ex.Message}");
+                    }
+                }
                 Log($"✅ All position closes completed.");
-            }
-            catch (TimeoutException)
-            {
-                Log("⚠️ Position close timed out after 15s. " +
-                    "Some positions may remain open.");
             }
             catch (Exception ex)
             {
@@ -881,30 +1089,13 @@ public class TradingBot : IDisposable
     private string? FindAsset(string securityCode)
     {
         if (string.IsNullOrEmpty(securityCode)) return null;
-        foreach (var asset in _config.Assets)
-        {
-            if (securityCode.Equals(asset, StringComparison.OrdinalIgnoreCase))
-                return asset;
-        }
-        return null;
+        return _assetLookup.TryGetValue(securityCode, out var asset) ? asset : null;
     }
 
     // ══════════════════════════════════════════════════════════
-    //  REST RATE LIMITING (P1 FIX: no fire-and-forget release)
+    //  REST RATE LIMITING
     // ══════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// P1 FIX: Pre-call delay, immediate release.
-    ///
-    /// Old approach:
-    ///   acquire → call → finally { Task.Run(delay → release) }
-    ///   Problem: background task outlives Dispose(), throws ObjectDisposedException.
-    ///
-    /// New approach:
-    ///   acquire → delay if needed → call → finally { release immediately }
-    ///   The delay happens BEFORE the call, and the semaphore is released
-    ///   synchronously in the finally block. No fire-and-forget tasks.
-    /// </summary>
     private async Task<T> ThrottledRestCallAsync<T>(Func<Task<T>> action)
     {
         await _restThrottle.WaitAsync(_cts.Token);
@@ -971,6 +1162,9 @@ public class TradingBot : IDisposable
                     $"WR:{GetWinRate():F1}%)");
                 Log($"  Daily PnL: ${_riskManager?.DailyPnl:F4}");
                 Log($"  Open: {_riskManager?.OpenPositionCount ?? 0}");
+                Log($"  WebSocket: {(_isConnected ? "🟢 Connected" : "🔴 Disconnected")} " +
+                    $"(reconnects: {_reconnectAttempts})");
+                Log($"  Pending orders: {_pendingOrders.Count}");
 
                 foreach (var asset in _config.Assets)
                 {
@@ -985,16 +1179,13 @@ public class TradingBot : IDisposable
                 Log("══════════════════════════════════════════");
             }
 
-            // P2 Fix: Write heartbeat file for Docker healthcheck.
-            // docker-compose healthcheck uses: find /app/state/heartbeat -mmin -60
-            // If this file hasn't been updated in 60 minutes, the container is
-            // considered unhealthy and Docker restarts it.
+            // Heartbeat for Docker healthcheck
             try
             {
                 var heartbeatPath = Path.Combine(_stateDirectory, "heartbeat");
                 File.WriteAllText(heartbeatPath, DateTime.UtcNow.ToString("O"));
             }
-            catch { /* best-effort — don't crash the status loop */ }            
+            catch { }
         }
     }
 
@@ -1012,6 +1203,7 @@ public class TradingBot : IDisposable
         Log($"║  Winning:           {_winningTrades,5}                    ║");
         Log($"║  Losing:            {_losingTrades,5}                    ║");
         Log($"║  Win Rate:          {GetWinRate(),8:F1}%               ║");
+        Log($"║  Reconnects:        {_reconnectAttempts,5}                    ║");
         Log("╚══════════════════════════════════════════════════╝");
     }
 
@@ -1064,6 +1256,20 @@ public class TradingBot : IDisposable
     public void Dispose()
     {
         _isRunning = false;
+
+        // FIX: Attempt position close if StopAsync wasn't called
+        if (Interlocked.CompareExchange(ref _stopRequested, 1, 0) == 0)
+        {
+            try
+            {
+                CloseAllPositionsAsync().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Dispose position close error: {ex.Message}");
+            }
+        }
+
         try { _cts.Cancel(); } catch { }
         try { _cts.Dispose(); } catch { }
         try { _restThrottle.Dispose(); } catch { }
@@ -1074,7 +1280,10 @@ public class TradingBot : IDisposable
     //  REST: Balance
     // ══════════════════════════════════════════════════════════
 
-    private static readonly HttpClient _http = new()
+    private static readonly HttpClient _http = new(new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5)  // FIX: respect DNS rotation
+    })
     {
         Timeout = TimeSpan.FromSeconds(10)
     };
@@ -1095,7 +1304,13 @@ public class TradingBot : IDisposable
 
         var resp = await _http.SendAsync(req);
         var json = await resp.Content.ReadAsStringAsync();
-        resp.EnsureSuccessStatusCode();
+
+        // FIX: Log error body before throwing
+        if (!resp.IsSuccessStatusCode)
+        {
+            Log($"❌ Balance fetch failed: {resp.StatusCode} — {json}");
+            throw new HttpRequestException($"Binance API error {resp.StatusCode}: {json}");
+        }
 
         using var doc = JsonDocument.Parse(json);
         foreach (var bal in doc.RootElement.GetProperty("balances").EnumerateArray())
@@ -1137,7 +1352,11 @@ public class TradingBot : IDisposable
 
             var resp = await _http.GetAsync(url);
             var json = await resp.Content.ReadAsStringAsync();
-            resp.EnsureSuccessStatusCode();
+            if (!resp.IsSuccessStatusCode)
+            {
+                Log($"❌ Exchange info failed: {resp.StatusCode} — {json}");
+                throw new HttpRequestException($"Binance API error {resp.StatusCode}: {json}");
+            }
 
             using var doc = JsonDocument.Parse(json);
             foreach (var sym in doc.RootElement.GetProperty("symbols").EnumerateArray())
@@ -1248,9 +1467,13 @@ public class TradingBot : IDisposable
                     candles[^2][4].GetString()!, CultureInfo.InvariantCulture);
                 _lastPrices[asset] = lastClose;
 
-                bool warmedUp = _traders.TryGetValue(asset, out var t) && t.IsWarmedUp;
-                Log($"📥 [{asset}] Complete. Price=${lastClose:F2} Warmed={warmedUp}");
-                t?.GoLive();
+                // FIX: GoLive under lock to prevent race with WS candles
+                lock (_lock)
+                {
+                    bool warmedUp = _traders.TryGetValue(asset, out var t) && t.IsWarmedUp;
+                    Log($"📥 [{asset}] Complete. Price=${lastClose:F2} Warmed={warmedUp}");
+                    t?.GoLive();
+                }
             }
         }
         catch (Exception ex)
@@ -1288,10 +1511,7 @@ public class TradingBot : IDisposable
             }
         }
 
-        // ── P1 FIX: Check restored positions against current prices ──
-        // At this point, historical candles have been loaded and
-        // _lastPrices are populated. Check if any persisted positions
-        // are in trouble before the first live candle arrives.
+        // ── P1 FIX (retained): Check restored positions ──
         lock (_lock)
         {
             if (_riskManager != null && _riskManager.OpenPositionCount > 0)
@@ -1450,6 +1670,22 @@ public class TradingBot : IDisposable
                 root.GetProperty("cummulativeQuoteQty").GetString() ?? "0",
                 CultureInfo.InvariantCulture);
             var avgPrice = filledQty > 0 ? filledQuote / filledQty : 0;
+
+            // FIX: Validate order status before processing fill
+            if (status != "FILLED")
+            {
+                Log($"⚠️ [{asset}] Order status={status} (expected FILLED). " +
+                    $"filledQty={filledQty}, orderId={orderId}");
+
+                if (filledQty <= 0)
+                {
+                    Log($"❌ [{asset}] Order not filled — clearing pending state");
+                    lock (_lock) { _pendingOrders.TryRemove(asset, out _); }
+                    return false;
+                }
+
+                Log($"⚠️ [{asset}] Processing partial fill: {filledQty} @ ${avgPrice:F2}");
+            }
 
             Log($"✅ [{asset}] FILLED ID={orderId} {status} " +
                 $"Qty={filledQty} Avg=${avgPrice:F2} Total=${filledQuote:F2}");

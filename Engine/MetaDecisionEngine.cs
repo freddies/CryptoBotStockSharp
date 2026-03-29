@@ -4,9 +4,17 @@ namespace CryptoBotStockSharp.Engine;
 
 /// <summary>
 /// Combines signals from multiple brains into a final trading decision.
-/// Each brain votes with a score and confidence level.
-/// Now accepts optional RegimeInfo to dynamically adjust brain weights
-/// and thresholds based on market conditions.
+///
+/// P0 Fixes:
+///   - Binary consensus replaced with weighted directional alignment.
+///     Old: required ALL brains to agree on sign → blocked all trend trades
+///     New: measures weight-adjusted directional dominance (0–1 scale)
+///   - Regime override: in strong TrendingBull/Bear, consensus forced true
+///     so the regime-favored brain can act without unanimous agreement
+///   - Brain1 confidence: continuous scaling replaces binary 0.5/0.8 step.
+///     Regime damping reduces Brain1 confidence when it contradicts a clear trend.
+///   - No-consensus threshold penalty: scaled by disagreement magnitude
+///     and reduced in strong regimes (was flat 1.15× multiplier)
 /// </summary>
 public class MetaDecisionEngine
 {
@@ -31,7 +39,6 @@ public class MetaDecisionEngine
             brain1Weight *= regime.Brain1WeightMult;
             brain2Weight *= regime.Brain2WeightMult;
 
-            // Renormalize so weights still sum to ~1.0
             double wSum = brain1Weight + brain2Weight;
             if (wSum > 0)
             {
@@ -42,8 +49,37 @@ public class MetaDecisionEngine
 
         var votes = new List<BrainVote>();
 
-        // ── Brain 1: Technical indicators (RSI, EMA, BB, MACD) ──
-        double techConfidence = Math.Abs(technicalSignal.CompositeScore) > 0.4 ? 0.8 : 0.5;
+        // ══════════════════════════════════════════════════════
+        //  P0 FIX: Brain 1 confidence — continuous + regime damping
+        //
+        //  Old: binary step function (0.5 or 0.8)
+        //  New: linear ramp 0.3→0.85 based on signal magnitude,
+        //       with 40% damping when Brain1 contradicts a strong regime.
+        //
+        //  This prevents a mildly-overbought RSI reading (score=-0.2,
+        //  conf=0.5) from blocking a strong trend signal from Brain2.
+        // ══════════════════════════════════════════════════════
+
+        double absScore = Math.Abs(technicalSignal.CompositeScore);
+        double techConfidence;
+
+        if (absScore > 0.6)
+            techConfidence = 0.85;
+        else if (absScore > 0.1)
+            techConfidence = 0.4 + (absScore / 0.6) * 0.45;
+        else
+            techConfidence = 0.3;
+
+        // Dampen Brain1 confidence when it contradicts a clear regime
+        if (regime != null && regime.Strength >= 0.6)
+        {
+            bool brain1AgreesTrend =
+                (regime.Regime == MarketRegime.TrendingBull && technicalSignal.CompositeScore > 0) ||
+                (regime.Regime == MarketRegime.TrendingBear && technicalSignal.CompositeScore < 0);
+            if (!brain1AgreesTrend)
+                techConfidence *= 0.6;
+        }
+
         votes.Add(new BrainVote
         {
             Name = "Technical",
@@ -68,6 +104,7 @@ public class MetaDecisionEngine
         double totalEffectiveWeight = 0;
         double weightedScore = 0;
         double totalConfidence = 0;
+        double totalWeight = 0;  // FIX: cache this
 
         foreach (var vote in votes)
         {
@@ -75,13 +112,15 @@ public class MetaDecisionEngine
             weightedScore += vote.Score * effectiveWeight;
             totalConfidence += vote.Confidence * vote.Weight;
             totalEffectiveWeight += effectiveWeight;
+            totalWeight += vote.Weight;  // FIX: accumulate once
         }
 
         if (totalEffectiveWeight > 0)
             weightedScore /= totalEffectiveWeight;
 
-        double avgConfidence = votes.Sum(v => v.Weight) > 0
-            ? totalConfidence / votes.Sum(v => v.Weight)
+        // FIX: Use cached totalWeight instead of re-iterating
+        double avgConfidence = totalWeight > 0
+            ? totalConfidence / totalWeight
             : 0;
 
         // ── Apply regime confidence adjustment ──
@@ -90,10 +129,46 @@ public class MetaDecisionEngine
             avgConfidence = Math.Max(0, Math.Min(1.0, avgConfidence + regime.ConfidenceAdj));
         }
 
-        // ── Check if brains agree on direction ──
-        bool allBullish = votes.All(v => v.Score > 0);
-        bool allBearish = votes.All(v => v.Score < 0);
-        bool consensus = votes.Count >= 2 && (allBullish || allBearish);
+        // ══════════════════════════════════════════════════════
+        //  P0 FIX: Weighted directional alignment replaces binary consensus
+        //
+        //  Old: consensus = all brains have same sign
+        //       → Brain1=-0.1, Brain2=+0.4 → signs differ → consensus=false
+        //       → threshold inflated 15% → trade blocked
+        //
+        //  New: directionalAlignment measures how strongly the weighted
+        //       votes lean one direction (0=split, 1=unanimous).
+        //       Consensus is true when alignment > 0.3.
+        //
+        //  Regime override: in strong TrendingBull/Bear (str≥0.6),
+        //  consensus is forced true. The regime already tells us which
+        //  brain to trust via weight multipliers.
+        // ══════════════════════════════════════════════════════
+
+        double directionalAlignment = 0;
+        if (votes.Count >= 2)
+        {
+            double bullWeight = votes.Where(v => v.Score > 0)
+                .Sum(v => v.Weight * v.Confidence);
+            double bearWeight = votes.Where(v => v.Score < 0)
+                .Sum(v => v.Weight * v.Confidence);
+            double totalDirectionalWeight = bullWeight + bearWeight;
+
+            if (totalDirectionalWeight > 0)
+                directionalAlignment = Math.Abs(bullWeight - bearWeight)
+                                       / totalDirectionalWeight;
+        }
+
+        bool consensus = votes.Count >= 2 && directionalAlignment > 0.3;
+
+        // Regime override: strong trend → trust the regime-weighted result
+        if (regime != null &&
+            (regime.Regime == MarketRegime.TrendingBull ||
+             regime.Regime == MarketRegime.TrendingBear) &&
+            regime.Strength >= 0.6)
+        {
+            consensus = true;
+        }
 
         // ── Calculate thresholds ──
         double buyThreshold = _config.BuyScoreThreshold;
@@ -106,11 +181,27 @@ public class MetaDecisionEngine
             sellThreshold *= regime.SellThresholdMult;
         }
 
-        // Require higher score when brains disagree
+        // ══════════════════════════════════════════════════════
+        //  P0 FIX: Softer no-consensus penalty
+        //
+        //  Old: flat 1.15× multiplier whenever brains disagree
+        //       → effective threshold up to 38% above base
+        //
+        //  New: penalty scales with disagreement magnitude (0–20%),
+        //       halved in strong regimes where the regime already
+        //       tells us which brain is more trustworthy.
+        // ══════════════════════════════════════════════════════
+
         if (!consensus)
         {
-            buyThreshold *= 1.15;
-            sellThreshold *= 1.15;
+            double disagreementPenalty = 1.0 + (0.20 * (1.0 - directionalAlignment));
+
+            // Reduce penalty when regime provides directional guidance
+            if (regime != null && regime.Strength >= 0.5)
+                disagreementPenalty = 1.0 + (disagreementPenalty - 1.0) * 0.5;
+
+            buyThreshold *= disagreementPenalty;
+            sellThreshold *= disagreementPenalty;
         }
 
         // ── Build decision ──
@@ -120,6 +211,7 @@ public class MetaDecisionEngine
             Confidence = avgConfidence,
             Consensus = consensus,
             BrainCount = votes.Count,
+            DirectionalAlignment = directionalAlignment,
         };
 
         // Build reasoning string
@@ -127,7 +219,8 @@ public class MetaDecisionEngine
             $"{v.Name}={v.Score:F3}(conf={v.Confidence:F2},w={v.Weight:F2})");
         decision.Reasoning = $"[{string.Join(" | ", voteStrings)}] " +
             $"→ Final={weightedScore:F3} " +
-            $"(consensus={consensus}, threshold={buyThreshold:F3})";
+            $"(consensus={consensus}, align={directionalAlignment:F2}, " +
+            $"threshold={buyThreshold:F3})";
 
         // Add regime info
         if (regime != null && regime.Regime != MarketRegime.Unknown)
@@ -189,4 +282,7 @@ public class MetaDecision
     // ── Regime fields ──
     public string MarketRegime { get; set; } = "";
     public double RegimeStrength { get; set; }
+
+    // ── P0 FIX: Expose alignment for logging ──
+    public double DirectionalAlignment { get; set; }
 }

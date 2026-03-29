@@ -41,6 +41,7 @@ class Program
         using var bot = new TradingBot(config);
 
         // ── Graceful shutdown ──
+        // FIX: Use a single CTS; CancelKeyPress just signals, doesn't block
         var cts = new CancellationTokenSource();
 
         // P1 Fix: CancelKeyPress uses try/catch around async call
@@ -48,28 +49,14 @@ class Program
         {
             e.Cancel = true;
             Console.WriteLine("\n🛑 Shutdown signal received...");
-            try
-            {
-                bot.StopAsync().GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️ Shutdown error: {ex.Message}");
-            }
-            cts.Cancel();
+            cts.Cancel(); 
         };
 
         // P1 Fix: ProcessExit uses synchronous wait
         AppDomain.CurrentDomain.ProcessExit += (sender, e) =>
         {
-            try
-            {
-                bot.StopAsync().GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️ ProcessExit shutdown error: {ex.Message}");
-            }
+            if (!cts.IsCancellationRequested)
+                cts.Cancel();
         };
 
         try
@@ -110,6 +97,9 @@ class Program
             Console.WriteLine($"❌ Fatal error: {ex.Message}");
             Console.WriteLine(ex.StackTrace);
         }
+
+        // FIX: Clean shutdown always goes through StopAsync here
+        await bot.StopAsync();
 
         Console.WriteLine("👋 Goodbye!");
     }
@@ -373,6 +363,77 @@ class Program
         if (config.UseRegimeDetection && config.RegimeMinHistory >= config.RegimeLookbackCandles)
             errors.Add($"RegimeMinHistory ({config.RegimeMinHistory}) must be < " +
                        $"RegimeLookbackCandles ({config.RegimeLookbackCandles})");
+
+        // ══════════════════════════════════════════════════════
+        //  Warmup vs Historical Preload Validation
+        //
+        //  PreloadHistoricalCandles fetches 100 candles from Binance
+        //  but skips the last (in-progress) → 99 usable candles.
+        //  If any indicator needs more than 99 candles to warm up,
+        //  the bot will run partially blind until enough live candles
+        //  arrive to fill the gap.
+        // ══════════════════════════════════════════════════════
+
+        const int HistoricalPreloadUsable = 99;
+
+        // Brain 1 warmup requirements
+        int brain1Warmup = new[]
+        {
+            config.RsiPeriod + 1,                               // RSI: period + 1 candle
+            config.BollingerPeriod,                              // BB: period candles
+            config.EmaSlowPeriod,                                // EMA: slow period for init
+            config.MacdSlowPeriod + config.MacdSignalPeriod,     // MACD: slow EMA + signal SMA seed
+        }.Max();
+
+        // Brain 2 warmup requirements
+        int brain2Warmup = new[]
+        {
+            config.StochPeriod + config.StochSmoothing,          // Stochastic K + D smoothing
+            config.AdxPeriod * 2,                                // ADX: needs 2× period
+            config.AtrPeriod + 1,                                // ATR: period + 1
+            20,                                                   // OBV EMA: hardcoded 20 candles
+            config.WilliamsRPeriod,                              // Williams %R: period candles
+            40,                                                   // StockSharpBrain.IsReady minimum
+        }.Max();
+
+        // Regime detector needs both brains ready + its own min history
+        int regimeWarmup = config.UseRegimeDetection
+            ? Math.Max(brain1Warmup, brain2Warmup) + config.RegimeMinHistory
+            : 0;
+
+        int totalWarmup = new[] { brain1Warmup, brain2Warmup, regimeWarmup }.Max();
+
+        if (totalWarmup > HistoricalPreloadUsable)
+        {
+            int gapCandles = totalWarmup - HistoricalPreloadUsable;
+            int gapMinutes = gapCandles * config.CandleTimeframeMinutes;
+
+            string timeStr;
+            if (gapMinutes >= 1440)
+                timeStr = $"{gapMinutes / 1440.0:F1} days";
+            else if (gapMinutes >= 60)
+                timeStr = $"{gapMinutes / 60.0:F1} hours";
+            else
+                timeStr = $"{gapMinutes} minutes";
+
+            warnings.Add($"Indicator warmup needs ~{totalWarmup} candles but only " +
+                        $"{HistoricalPreloadUsable} historical candles are preloaded. " +
+                        $"Bot will need {gapCandles} additional live candles (~{timeStr}) " +
+                        $"before all signals are active. " +
+                        $"(Brain1={brain1Warmup}, Brain2={brain2Warmup}" +
+                        $"{(config.UseRegimeDetection ? $", Regime={regimeWarmup}" : "")})");
+        }
+        else
+        {
+            int margin = HistoricalPreloadUsable - totalWarmup;
+            if (margin < 10)
+            {
+                warnings.Add($"Tight warmup margin: need {totalWarmup} candles, " +
+                            $"preload provides {HistoricalPreloadUsable} " +
+                            $"(only {margin} candles spare). " +
+                            $"Consider increasing indicator periods cautiously.");
+            }
+        }
 
         // ══════════════════════════════════════════════════════
         //  Output Results
